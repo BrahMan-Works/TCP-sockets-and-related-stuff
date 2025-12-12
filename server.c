@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -73,7 +75,41 @@ int main()
         {
             int fd = events[i].data.fd;
 
-            if(fd == listenFd) printf("New connection event detected!\n");
+            if(fd == listenFd)
+            {
+                while(true)
+                {
+                    struct sockaddr_in clientAddr;
+                    socklen_t clientLen = sizeof(clientAddr);
+
+                    int clientFd = accept(listenFd, (struct sockaddr*)&clientAddr, &clientLen);
+                    if(clientFd < 0)
+                    {
+                        if(errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        else
+                        {
+                            perror("accept");
+                            break;
+                        }
+                    }
+
+                    int flags = fcntl(clientFd, F_GETFL, 0);
+                    fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
+
+                    struct epoll_event ev;
+                    ev.events = EPOLLIN | EPOLLET;
+                    ev.data.fd = clientFd;
+
+                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &ev) < 0)
+                    {
+                        perror("epoll_ctl: client add");
+                        close(clientFd);
+                        continue;
+                    }
+
+                    printf("accepted client fd = %d\n", clientFd);
+                }
+            }
             else
             {
                 // handle client I/O here
