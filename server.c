@@ -11,8 +11,72 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 
+#define READ_BUF_SIZE 4096
+
+int epfd;
+
+typedef struct
+{
+    int fd;
+    char buf[READ_BUF_SIZE];
+    size_t len;
+} conn_t;
+
+void closeConn(conn_t* c)
+{
+    epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    free(c);
+}
+
+void handleRead(conn_t* c)
+{
+    while(true)
+    {
+        ssize_t n = read(c->fd, c->buf + c->len, READ_BUF_SIZE- c->len);
+        if(n > 0)
+        {
+            c->len += n;
+            write(STDOUT_FILENO, c->buf, c->len);
+            if(strstr(c->buf, "\r\n\r\n"))
+            {
+                printf("\n--- end of HTTP request ---\n");
+            }
+
+            if(c->len == READ_BUF_SIZE)
+            {
+                printf("request too large, closing\n");
+                closeConn(c);
+                return;
+            }
+        }
+        else if(n == 0)
+        {
+            printf("client %d disconnected\n", c->fd);
+            closeConn(c);
+            return;
+        }
+        else
+        {
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // no more data
+                break;
+            }
+            else
+            {
+                perror("read");
+                closeConn(c);
+                return;
+            }
+        }
+    }
+}
+
 int main()
 {
+    epfd = epoll_create1(0);
+
     int listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if(listenFd < 0)
     {
@@ -96,9 +160,13 @@ int main()
                     int flags = fcntl(clientFd, F_GETFL, 0);
                     fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
 
+                    conn_t* c = malloc(sizeof(conn_t));
+                    c->fd = clientFd;
+                    c->len = 0;
+
                     struct epoll_event ev;
                     ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = clientFd;
+                    ev.data.ptr = c;
 
                     if(epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &ev) < 0)
                     {
@@ -107,12 +175,14 @@ int main()
                         continue;
                     }
 
-                    printf("accepted client fd = %d\n", clientFd);
+                    printf("accepted client fd = %d\n", clientFd);        
                 }
             }
             else
             {
-                // handle client I/O here
+                conn_t* c = (conn_t*)events[i].data.ptr;
+                handleRead(c);
+                // printf("read %d bytes, total = %zu\n", n, c->len);
             }
         }
     }
