@@ -12,14 +12,19 @@
 #include <sys/epoll.h>
 
 #define READ_BUF_SIZE 4096
+#define WRITE_BUF_SIZE 4096
 
 int epfd;
 
 typedef struct
 {
     int fd;
-    char buf[READ_BUF_SIZE];
-    size_t len;
+    char rBuf[READ_BUF_SIZE];
+    size_t rLen;
+
+    char wBuf[WRITE_BUF_SIZE];
+    size_t wLen;
+    size_t wSent;
 } conn_t;
 
 void closeConn(conn_t* c)
@@ -33,17 +38,17 @@ void handleRead(conn_t* c)
 {
     while(true)
     {
-        ssize_t n = read(c->fd, c->buf + c->len, READ_BUF_SIZE- c->len);
+        ssize_t n = read(c->fd, c->rBuf + c->rLen, READ_BUF_SIZE- c->rLen);
         if(n > 0)
         {
-            c->len += n;
-            write(STDOUT_FILENO, c->buf, c->len);
-            if(strstr(c->buf, "\r\n\r\n"))
+            c->rLen += n;
+            write(STDOUT_FILENO, c->rBuf, c->rLen);
+            if(strstr(c->rBuf, "\r\n\r\n"))
             {
                 printf("\n--- end of HTTP request ---\n");
             }
 
-            if(c->len == READ_BUF_SIZE)
+            if(c->rLen == READ_BUF_SIZE)
             {
                 printf("request too large, closing\n");
                 closeConn(c);
@@ -71,6 +76,34 @@ void handleRead(conn_t* c)
             }
         }
     }
+}
+
+void handleWrite(conn_t* c)
+{
+    while(c->wSent < c->wLen)
+    {
+        ssize_t n = write(c->fd, c->wBuf + c->wSent, c->wLen - c->wSent);
+        if(n > 0)
+        {
+            c->wSent += n;
+        }
+        else if(n == -1)
+        {
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // kernel buffer full
+                return;
+            }
+            else
+            {
+                perror("write");
+                closeConn(c);
+                return;
+            }
+        }
+    }
+
+    closeConn(c);
 }
 
 int main()
@@ -162,10 +195,21 @@ int main()
 
                     conn_t* c = malloc(sizeof(conn_t));
                     c->fd = clientFd;
-                    c->len = 0;
+                    c->rLen = 0;
+
+                    const char* body = "Hello, User!\n";
+                    c->wLen = snprintf(c->wBuf, WRITE_BUF_SIZE,
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "content-length: %zu\r\n"
+                                        "content-type: text/plain\r\n"
+                                        "connection: close\r\n"
+                                        "\r\n"
+                                        "%s", strlen(body), body);
+
+                    c->wSent = 0;
 
                     struct epoll_event ev;
-                    ev.events = EPOLLIN | EPOLLET;
+                    ev.events = EPOLLOUT | EPOLLET;
                     ev.data.ptr = c;
 
                     if(epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &ev) < 0)
@@ -175,14 +219,20 @@ int main()
                         continue;
                     }
 
-                    printf("accepted client fd = %d\n", clientFd);        
+                    // printf("accepted client fd = %d\n", clientFd);        
                 }
             }
             else
             {
-                conn_t* c = (conn_t*)events[i].data.ptr;
-                handleRead(c);
-                // printf("read %d bytes, total = %zu\n", n, c->len);
+                conn_t* c = events[i].data.ptr;
+                if(events[i].events & EPOLLIN)
+                {
+                    handleRead(c);
+                }
+                if(events[i].events & EPOLLOUT)
+                {
+                    handleWrite(c);
+                }
             }
         }
     }
