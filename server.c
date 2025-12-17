@@ -19,6 +19,7 @@ int epfd;
 typedef struct
 {
     int fd;
+    bool closed;
     char rBuf[READ_BUF_SIZE];
     size_t rLen;
 
@@ -29,6 +30,9 @@ typedef struct
 
 void closeConn(conn_t* c)
 {
+    if(c->closed) return;
+
+    c->closed = true;
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     free(c);
@@ -171,6 +175,15 @@ int main()
         for(int i = 0; i < n; ++i)
         {
             int fd = events[i].data.fd;
+          
+            uint32_t evs = events[i].events;
+            conn_t* c = events[i].data.ptr;
+                
+            if(evs & (EPOLLHUP | EPOLLERR))
+            {
+                closeConn(c);
+                continue;
+            }
 
             if(fd == listenFd)
             {
@@ -219,17 +232,17 @@ int main()
                         continue;
                     }
 
-                    // printf("accepted client fd = %d\n", clientFd);        
+                    printf("accepted client fd = %d\n", clientFd);        
                 }
             }
             else
             {
                 conn_t* c = events[i].data.ptr;
-                if(events[i].events & EPOLLIN)
+                if(!c->closed && (evs & EPOLLIN))
                 {
                     handleRead(c);
                 }
-                if(events[i].events & EPOLLOUT)
+                if(!c->closed && (evs & EPOLLOUT))
                 {
                     handleWrite(c);
                 }
