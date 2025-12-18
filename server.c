@@ -38,46 +38,111 @@ void closeConn(conn_t* c)
     free(c);
 }
 
-void handleRead(conn_t* c)
+void buildResponse(conn_t* c, int status, const char* statusText, const char* body)
 {
-    while(true)
+    c->wLen = snprintf(c->wBuf, WRITE_BUF_SIZE,
+                        "HTTP/1.1 %d %s\r\n"
+                        "content-length: %zu\r\n"
+                        "content-type: text/plain\r\n"
+                        "connection: close\r\n"
+                        "\r\n"
+                        "%s", status, statusText, strlen(body), body);
+    c->wSent = 0;
+}
+
+void handleRead(conn_t *c)
+{
+    while (true)
     {
-        ssize_t n = read(c->fd, c->rBuf + c->rLen, READ_BUF_SIZE- c->rLen);
-        if(n > 0)
+        ssize_t n = read(c->fd, c->rBuf + c->rLen, READ_BUF_SIZE - c->rLen);
+
+        if (n > 0)
         {
             c->rLen += n;
-            write(STDOUT_FILENO, c->rBuf, c->rLen);
-            if(strstr(c->rBuf, "\r\n\r\n"))
-            {
-                printf("\n--- end of HTTP request ---\n");
-            }
 
-            if(c->rLen == READ_BUF_SIZE)
+            if (c->rLen == READ_BUF_SIZE)
             {
-                printf("request too large, closing\n");
                 closeConn(c);
                 return;
             }
+
+            if (!strstr(c->rBuf, "\r\n\r\n")) continue;
+
+            char *lineEnd = strstr(c->rBuf, "\r\n");
+            if (!lineEnd)
+            {
+                closeConn(c);
+                return;
+            }
+
+            *lineEnd = '\0';
+
+            char method[8];
+            char path[256];
+
+            if (sscanf(c->rBuf, "%7s %255s", method, path) != 2)
+            {
+                closeConn(c);
+                return;
+            }
+
+            int status;
+            const char *statusText;
+            const char *body;
+
+            if (strcmp(method, "GET") != 0)
+            {
+                status = 405;
+                statusText = "Method Not Allowed";
+                body = "Only GET supported\n";
+            }
+            else if (strcmp(path, "/") == 0)
+            {
+                status = 200;
+                statusText = "OK";
+                body = "welcome to the server\n";
+            }
+            else if (strcmp(path, "/health") == 0)
+            {
+                status = 200;
+                statusText = "OK";
+                body = "OK\n";
+            }
+            else if (strcmp(path, "/hello") == 0)
+            {
+                status = 200;
+                statusText = "OK";
+                body = "hello, user!\n";
+            }
+            else
+            {
+                status = 404;
+                statusText = "Not Found";
+                body = "404 not found\n";
+            }
+
+            buildResponse(c, status, statusText, body);
+
+            struct epoll_event ev;
+            ev.events = EPOLLOUT | EPOLLET;
+            ev.data.ptr = c;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+
+            c->rLen = 0;
+            
+            return;
         }
-        else if(n == 0)
+        else if (n == 0)
         {
-            printf("client %d disconnected\n", c->fd);
             closeConn(c);
             return;
         }
         else
         {
-            if(errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                // no more data
-                break;
-            }
-            else
-            {
-                perror("read");
-                closeConn(c);
-                return;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+
+            closeConn(c);
+            return;
         }
     }
 }
@@ -144,7 +209,6 @@ int main()
         exit(1);
     }
 
-    int epfd = epoll_create1(0);
     if(epfd < 0)
     {
         perror("epoll_create1");
@@ -221,18 +285,18 @@ int main()
 
                     c->wSent = 0;
 
-                    struct epoll_event ev;
-                    ev.events = EPOLLOUT | EPOLLET;
-                    ev.data.ptr = c;
+                    struct epoll_event cev;
+                    cev.events = EPOLLIN | EPOLLET;
+                    cev.data.ptr = c;
 
-                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &ev) < 0)
+                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, clientFd, &cev) < 0)
                     {
                         perror("epoll_ctl: client add");
                         close(clientFd);
                         continue;
                     }
 
-                    printf("accepted client fd = %d\n", clientFd);        
+                    // printf("accepted client fd = %d\n", clientFd);        
                 }
             }
             else
