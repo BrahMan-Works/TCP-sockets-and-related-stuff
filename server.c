@@ -1,4 +1,6 @@
 /* a basic TCP server  */
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -16,25 +18,42 @@
 
 int epfd;
 
+typedef enum
+{
+    STATE_READING,
+    STATE_WRITING
+} conn_state_t;
+
 typedef struct
 {
     int fd;
     bool closed;
+    conn_state_t state;
+
     char rBuf[READ_BUF_SIZE];
     size_t rLen;
 
     char wBuf[WRITE_BUF_SIZE];
     size_t wLen;
     size_t wSent;
+
+    bool keepAlive;
 } conn_t;
 
 void closeConn(conn_t* c)
 {
-    if(c->closed) return;
+    if(c->closed)
+    {
+        fprintf(stderr, "DOUBLE CLOSE on fd %d\n", c->fd);
+        return;
+    }
+
+    // fprintf(stderr, "Closing fd %d\n", c->fd);
 
     c->closed = true;
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
+    c->fd = -1;
     free(c);
 }
 
@@ -44,9 +63,9 @@ void buildResponse(conn_t* c, int status, const char* statusText, const char* bo
                         "HTTP/1.1 %d %s\r\n"
                         "content-length: %zu\r\n"
                         "content-type: text/plain\r\n"
-                        "connection: close\r\n"
+                        "connection: %s\r\n"
                         "\r\n"
-                        "%s", status, statusText, strlen(body), body);
+                        "%s", status, statusText, strlen(body), (c->keepAlive ? "keep-alive" : "close"), body);
     c->wSent = 0;
 }
 
@@ -66,7 +85,9 @@ void handleRead(conn_t *c)
                 return;
             }
 
-            if (!strstr(c->rBuf, "\r\n\r\n")) continue;
+            c->keepAlive = true;
+
+            if(strcasestr(c->rBuf, "Connection: Close")) c->keepAlive = false;
 
             char *lineEnd = strstr(c->rBuf, "\r\n");
             if (!lineEnd)
@@ -122,6 +143,7 @@ void handleRead(conn_t *c)
             }
 
             buildResponse(c, status, statusText, body);
+            c->state = STATE_WRITING;
 
             struct epoll_event ev;
             ev.events = EPOLLOUT | EPOLLET;
@@ -172,7 +194,23 @@ void handleWrite(conn_t* c)
         }
     }
 
-    closeConn(c);
+    if(c->keepAlive)
+    {
+        c->state = STATE_READING;
+        c->rLen = 0;
+        c->wLen = 0;
+        c->wSent = 0;
+        c->keepAlive = true;
+
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.ptr = c;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+    }
+    else
+    {
+        closeConn(c);
+    }
 }
 
 int main()
@@ -241,14 +279,7 @@ int main()
             int fd = events[i].data.fd;
           
             uint32_t evs = events[i].events;
-            conn_t* c = events[i].data.ptr;
                 
-            if(evs & (EPOLLHUP | EPOLLERR))
-            {
-                closeConn(c);
-                continue;
-            }
-
             if(fd == listenFd)
             {
                 while(true)
@@ -260,30 +291,30 @@ int main()
                     if(clientFd < 0)
                     {
                         if(errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        else
-                        {
-                            perror("accept");
-                            break;
-                        }
+                        
+                        perror("accept");
+                        break;
                     }
 
                     int flags = fcntl(clientFd, F_GETFL, 0);
                     fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
 
                     conn_t* c = malloc(sizeof(conn_t));
+                    if(!c)
+                    {
+                        close(clientFd);
+                        continue;
+                    }
+
                     c->fd = clientFd;
+                    c->closed = false;
+                    c->state = STATE_READING;
+
                     c->rLen = 0;
-
-                    const char* body = "Hello, User!\n";
-                    c->wLen = snprintf(c->wBuf, WRITE_BUF_SIZE,
-                                        "HTTP/1.1 200 OK\r\n"
-                                        "content-length: %zu\r\n"
-                                        "content-type: text/plain\r\n"
-                                        "connection: close\r\n"
-                                        "\r\n"
-                                        "%s", strlen(body), body);
-
+                    c->wLen = 0;
                     c->wSent = 0;
+
+                    c->keepAlive = true;
 
                     struct epoll_event cev;
                     cev.events = EPOLLIN | EPOLLET;
@@ -293,21 +324,29 @@ int main()
                     {
                         perror("epoll_ctl: client add");
                         close(clientFd);
+                        free(c);
                         continue;
                     }
 
                     // printf("accepted client fd = %d\n", clientFd);        
                 }
+
+                continue;
             }
             else
             {
                 conn_t* c = events[i].data.ptr;
-                if(!c->closed && (evs & EPOLLIN))
+                if(!c || c->closed)
                 {
+                    fprintf(stderr, "NULL conn ptr\n");
+                    continue;
+                }
+
+                if (!c->closed && c->state == STATE_READING && (evs & EPOLLIN)) {
                     handleRead(c);
                 }
-                if(!c->closed && (evs & EPOLLOUT))
-                {
+
+                if (!c->closed && c->state == STATE_WRITING && (evs & EPOLLOUT)) {
                     handleWrite(c);
                 }
             }
