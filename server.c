@@ -8,13 +8,18 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 
 #define READ_BUF_SIZE 4096
 #define WRITE_BUF_SIZE 4096
+
+#define READ_TIMEOUT 5
+#define IDLE_TIMEOUT 10
 
 int epfd;
 
@@ -28,6 +33,10 @@ typedef struct
 {
     int fd;
     bool closed;
+
+    int timerFd;
+    time_t deadline;
+
     conn_state_t state;
 
     char rBuf[READ_BUF_SIZE];
@@ -42,19 +51,22 @@ typedef struct
 
 void closeConn(conn_t* c)
 {
-    if(c->closed)
-    {
-        fprintf(stderr, "DOUBLE CLOSE on fd %d\n", c->fd);
-        return;
-    }
-
-    // fprintf(stderr, "Closing fd %d\n", c->fd);
-
+    if(c->closed) return;
     c->closed = true;
+
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, c->timerFd, NULL);
+
     close(c->fd);
-    c->fd = -1;
+    close(c->timerFd);
     free(c);
+}
+
+void resetTimer(conn_t* c, int seconds)
+{
+    struct itimerspec its = {0};
+    its.it_value.tv_sec = seconds;
+    timerfd_settime(c->timerFd, 0, &its, NULL);
 }
 
 void buildResponse(conn_t* c, int status, const char* statusText, const char* body)
@@ -77,6 +89,7 @@ void handleRead(conn_t *c)
 
         if (n > 0)
         {
+            resetTimer(c, READ_TIMEOUT);
             c->rLen += n;
 
             if (c->rLen == READ_BUF_SIZE)
@@ -196,6 +209,8 @@ void handleWrite(conn_t* c)
 
     if(c->keepAlive)
     {
+        resetTimer(c, IDLE_TIMEOUT);
+
         c->state = STATE_READING;
         c->rLen = 0;
         c->wLen = 0;
@@ -296,6 +311,18 @@ int main()
                         break;
                     }
 
+                    int tFd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+                    if(tFd < 0)
+                    {
+                        perror("timerfd_create");
+                        close(clientFd);
+                        continue;
+                    }
+
+                    struct itimerspec its = {0};
+                    its.it_value.tv_sec = READ_TIMEOUT;
+                    timerfd_settime(tFd, 0, &its, NULL);
+
                     int flags = fcntl(clientFd, F_GETFL, 0);
                     fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
 
@@ -306,8 +333,14 @@ int main()
                         continue;
                     }
 
+                    struct epoll_event tev;
+                    tev.events = EPOLLIN;
+                    tev.data.ptr = c;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, tFd, &tev);
+
                     c->fd = clientFd;
                     c->closed = false;
+                    c->timerFd = tFd;
                     c->state = STATE_READING;
 
                     c->rLen = 0;
@@ -338,7 +371,23 @@ int main()
                 conn_t* c = events[i].data.ptr;
                 if(!c || c->closed)
                 {
-                    fprintf(stderr, "NULL conn ptr\n");
+                    // fprintf(stderr, "NULL conn ptr\n");
+                    continue;
+                }
+
+                if(events[i].data.fd == c->timerFd)
+                {
+                    uint64_t expirations;
+                    read(c->timerFd, &expirations, sizeof(expirations));
+
+                    fprintf(stderr, "connection timeout fd = %d\n", c->fd);
+                    closeConn(c);
+                    continue;
+                }
+
+                if(evs &(EPOLLERR | EPOLLHUP))
+                {
+                    closeConn(c);
                     continue;
                 }
 
